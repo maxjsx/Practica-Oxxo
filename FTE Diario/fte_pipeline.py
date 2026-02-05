@@ -418,6 +418,20 @@ def main():
     resumen = resumen[resumen["DOTACION_REAL"] > 0].copy()
 
     resumen["BRECHA (REAL-TEORICO)"] = resumen["FTE REAL"] - resumen["FTE TEORICO"]
+    # FTE REAL desde el día (solo donde hay CECO)
+    fte_real = compute_fte_real(base)  # devuelve CECO, DOTACION_REAL, FTE REAL
+
+    # Universo tiendas (desde FTE autorizado limpio)
+    universo = fte_aut.rename(columns={
+        "NOMBRE_DISPLAY": "GRUPO",
+        "FTE AUT": "FTE TEORICO",
+    })[["CECO", "GRUPO", "FTE TEORICO"]].copy()
+
+    # Resumen SOLO TIENDAS CON DOTACIÓN HOY
+    resumen = universo.merge(fte_real, on="CECO", how="inner")
+    resumen = resumen[resumen["DOTACION_REAL"] > 0].copy()
+
+    resumen["BRECHA (REAL-TEORICO)"] = resumen["FTE REAL"] - resumen["FTE TEORICO"]
 
     pivot = resumen.pivot_table(
         index=["CECO", "GRUPO"],
@@ -425,12 +439,11 @@ def main():
         aggfunc="sum"
     ).reset_index()
 
-    # prints de control (dentro de main)
-    print("Tiendas agrupador (universo):", agrupador["CECO"].nunique())
-    print("Tiendas fte_aut (filtrado a universo):", fte_aut["CECO"].nunique())
+    print("Tiendas fte_aut (universo tiendas):", fte_aut["CECO"].nunique())
     print("Tiendas con dotación hoy (fte_real):", fte_real["CECO"].nunique())
     print("Tiendas en resumen:", resumen["CECO"].nunique())
     print("Filas base sin CECO (mismatch de nombre):", int(base["CECO"].isna().sum()))
+
 
     out_path = OUTPUT / "FTE_resultado.xlsx"
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
