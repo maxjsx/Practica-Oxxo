@@ -34,7 +34,7 @@ FILES = {
     "gestion": pick_one("GestionAsistencia*.xls*"),
     "bajas": pick_one("Copia_de_Bajas*.xls*"),
     "activos": pick_one("Activos_inactivos*.xls*"),
-    "talana": pick_one("Lista_*Empleados_Talana*.xls*"),  # <- clave
+    "talana": pick_one("Lista*Empleados_Talana*.xls*"),  # <- clave
     "permisos": pick_one("PermisosAsignados*.xls*"),
     "fte_aut": pick_one("00 - FTE AUTORIZADO*.xls*"),
     "agrupador": pick_one("Agrupador 5*.xls*"),
@@ -84,7 +84,10 @@ def normalize_rut(x) -> str:
 def normalize_text(x) -> str:
     if pd.isna(x):
         return ""
-    return str(x).strip().upper()
+    s = str(x).upper().replace("\xa0", " ").strip()
+    s = re.sub(r"\s+", " ", s)  # colapsa tabs/múltiples espacios
+    return s
+
 
 # -----------------------------
 # Lectura inteligente de FTE Autorizado
@@ -278,39 +281,29 @@ def main():
     month_sheet = pick_latest_month_sheet(xls.sheet_names)
     fte_aut = read_fte_aut_sheet(FILES["fte_aut"], sheet_name=month_sheet)
 
-    # 3) Cruzar Gestion con FTE Autorizado por tienda
-    base = gestion.merge(
-        fte_aut,
-        left_on="GRUPO",
-        right_on="NOMBRE MAESTRA",
-        how="left"
-    ).drop(columns=["NOMBRE MAESTRA"])
+   # 3) Base del día (solo los que aparecen en Gestion)
+base = gestion.merge(
+    fte_aut,
+    left_on="GRUPO",
+    right_on="NOMBRE MAESTRA",
+    how="left"
+).drop(columns=["NOMBRE MAESTRA"])
 
-    # 4) Traer fechas por RUT
-    base = base.merge(activos, on="RUT", how="left")
-    base = base.merge(bajas, on="RUT", how="left")
+# 4) FTE REAL desde el día
+fte_real = compute_fte_real(base)  # devuelve CECO, GRUPO, DOTACION_REAL, FTE REAL
 
-    # 5) Renombrar
-    base = base.rename(columns={
-        "FECHA INGRESO": "FECHA DE INGRESO",
-        "FECHA EGRESO": "FECHA DE EGRESO",
-        "FTE AUT": "FTE TEORICO",
-    })
+# 5) Universo completo de tiendas desde FTE Autorizado
+universo = fte_aut.rename(columns={
+    "NOMBRE MAESTRA": "GRUPO",
+    "FTE AUT": "FTE TEORICO",
+}).copy()
 
-    # 6) Resumen
-    fte_real = compute_fte_real(base)
-    resumen = fte_real.merge(
-        base[["CECO", "GRUPO", "FTE TEORICO"]].drop_duplicates(),
-        on=["CECO", "GRUPO"],
-        how="left"
-    )
-    resumen["BRECHA (REAL-TEORICO)"] = resumen["FTE REAL"] - resumen["FTE TEORICO"]
+# 6) Resumen final: todas las tiendas, aunque no tengan gente hoy
+resumen = universo.merge(fte_real, on=["CECO", "GRUPO"], how="left")
+resumen["DOTACION_REAL"] = resumen["DOTACION_REAL"].fillna(0).astype(int)
+resumen["FTE REAL"] = resumen["FTE REAL"].fillna(0.0)
+resumen["BRECHA (REAL-TEORICO)"] = resumen["FTE REAL"] - resumen["FTE TEORICO"]
 
-    pivot = resumen.pivot_table(
-        index=["CECO", "GRUPO"],
-        values=["FTE TEORICO", "FTE REAL", "BRECHA (REAL-TEORICO)"],
-        aggfunc="sum"
-    ).reset_index()
 
     # 7) Exportar
     out_path = OUTPUT / "FTE_resultado.xlsx"
