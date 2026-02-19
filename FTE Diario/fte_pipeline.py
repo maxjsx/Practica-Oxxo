@@ -40,7 +40,7 @@ FILES = {
     "talana": pick_one("Lista*Empleados_Talana*.xls*"),
     "permisos": pick_one("PermisosAsignados*.xls*"),
     "fte_aut": pick_one("00 - FTE AUTORIZADO*.xls*"),
-    "agrupador": pick_one("Agrupador 5*.xls*"),
+    "agrupador": pick_one("Agrupador 9*.xls*"),
 
 }
 
@@ -185,41 +185,47 @@ def read_fte_aut_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
     return df
 
 def read_agrupador_cargos(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path)
+    # Leemos sin header para encontrar la fila donde realmente empieza la tabla
+    raw = pd.read_excel(path, sheet_name="AGRUPADOR", header=None)
+
+    header_row = None
+    for i in range(min(200, len(raw))):
+        row = [("" if pd.isna(v) else str(v).strip().upper()) for v in raw.iloc[i].tolist()]
+        if "CARGO" in row and any("FTE" in v for v in row):
+            header_row = i
+            break
+
+    if header_row is None:
+        raise ValueError("No encontré la fila header de la tabla de cargos (busqué 'CARGO' y algo con 'FTE').")
+
+    df = pd.read_excel(path, sheet_name="AGRUPADOR", header=header_row)
     df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
 
-    # buscar columna cargo
-    cargo_col = find_col(df.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
-    if not cargo_col:
-        raise ValueError(f"No encontré columna de CARGO en Agrupador. Columnas: {list(df.columns)}")
+    # Columnas que necesitamos (en tu archivo suele venir como 'AGRUPA CARGO_2')
+    cargo_col = "CARGO" if "CARGO" in df.columns else find_col(df.columns, ["CARGO"])
+    agrupa_col = find_col(df.columns, ["AGRUPA CARGO"])
+    fte_col = find_col(df.columns, ["FTE TEORICO", "FTE TEORI", "FTE"])
 
-    # buscar columna FTE (o equivalente)
-    fte_col = find_col(df.columns, ["FTE", "F.T.E", "FTE TEORICO", "FTE_TEORICO"])
-    if not fte_col:
-        # fallback: si no existe FTE, a veces viene como HORAS o JORNADA (ej 44, 30, 20)
-        horas_col = find_col(df.columns, ["HORAS", "JORNADA", "HRS", "HORA"])
-        if not horas_col:
-            raise ValueError(
-                f"No encontré columna FTE ni HORAS/JORNADA en Agrupador. Columnas: {list(df.columns)}"
-            )
-        out = df[[cargo_col, horas_col]].copy()
-        out = out.rename(columns={cargo_col: "CARGO", horas_col: "HORAS"})
-        out["CARGO"] = out["CARGO"].map(normalize_text)
-        out["HORAS"] = pd.to_numeric(out["HORAS"], errors="coerce")
-        # Si 44 hrs = 1.0
-        out["FTE_TEORICO_PERSONA"] = out["HORAS"] / 44.0
-        out = out.dropna(subset=["CARGO", "FTE_TEORICO_PERSONA"])
-        return out[["CARGO", "FTE_TEORICO_PERSONA"]].drop_duplicates(subset=["CARGO"], keep="last")
+    if not cargo_col or not agrupa_col or not fte_col:
+        raise ValueError(f"No encontré columnas esperadas en la tabla de cargos. Columnas: {list(df.columns)}")
 
-    out = df[[cargo_col, fte_col]].copy()
-    out = out.rename(columns={cargo_col: "CARGO", fte_col: "FTE_TEORICO_PERSONA"})
+    out = df[[cargo_col, agrupa_col, fte_col]].copy()
+    out = out.rename(columns={
+        cargo_col: "CARGO",
+        agrupa_col: "AGRUPA CARGO",
+        fte_col: "FTE_TEORICO_PERSONA"
+    })
+
     out["CARGO"] = out["CARGO"].map(normalize_text)
+    out["AGRUPA CARGO"] = out["AGRUPA CARGO"].map(normalize_text)
     out["FTE_TEORICO_PERSONA"] = pd.to_numeric(out["FTE_TEORICO_PERSONA"], errors="coerce")
-    out = out.dropna(subset=["CARGO", "FTE_TEORICO_PERSONA"])
 
-    # limpieza: fte entre 0 y 1.2 (por si hay basura)
-    out = out[out["FTE_TEORICO_PERSONA"].between(0, 1.2)]
-    return out.drop_duplicates(subset=["CARGO"], keep="last")
+    out = out.dropna(subset=["CARGO", "FTE_TEORICO_PERSONA"])
+    out = out[out["FTE_TEORICO_PERSONA"].between(0, 1.2)]  # limpieza
+    out = out.drop_duplicates(subset=["CARGO"], keep="last")
+
+    return out
+
 
 def read_agrupador_inclusion(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="INCLS", header=3)
@@ -240,32 +246,34 @@ def read_agrupador_inclusion(path: Path) -> pd.DataFrame:
     out = out.dropna(subset=["RUT", "FTE_INCLUSION"])
     return out.drop_duplicates(subset=["RUT"], keep="last")
 
-def fte_teorico_desde_cargo(cargo: str) -> float:
-    c = normalize_text(cargo)
 
-    # 1) Si dice PT <horas>
-    m = re.search(r"\bPT\s*(\d{1,2})\b", c)
+def fte_teorico_desde_cargo(cargo) -> float:
+    """
+    Regla:
+    - Si CARGO contiene PT + horas (20/25/30/etc) => horas/44
+    - Si NO contiene PT => 1.0
+    """
+    c = normalize_text(cargo)  # ya deja MAYUS + espacios normalizados
+
+    # 1) PT30 / PT 30 / PT-30 / PT 30 HRS / PT30HRS
+    m = re.search(r"\bPT\s*[-]?\s*(\d{1,2})\b", c)
+    if not m:
+        m = re.search(r"\bPT(\d{1,2})\b", c)
+    if not m:
+        m = re.search(r"\bPT\s*[-]?\s*(\d{1,2})\s*(HRS|HORAS)?\b", c)
+
+    # 2) PART TIME 30
+    if not m:
+        m = re.search(r"\bPART\s*TIME\s*(\d{1,2})\b", c)
+
     if m:
         horas = int(m.group(1))
-        return round(horas / 44.0, 4)
+        # por seguridad: solo horas razonables
+        if 1 <= horas <= 44:
+            return round(horas / 44.0, 6)
 
-    # 2) Si viene como "30 HRS" / "30 HORAS"
-    m = re.search(r"\b(\d{1,2})\s*(HRS|HORAS)\b", c)
-    if m:
-        horas = int(m.group(1))
-        return round(horas / 44.0, 4)
-
-    # 3) Full time por cargo (si no es PT)
-    if "JEFE DE SALA" in c:
-        return 1.0
-    if "LIDER" in c:
-        return 1.0
-    if c.startswith("CAJERO") and "PT" not in c:
-        return 1.0
-
-    # fallback: si no sabemos, dejamos 1 (mejor que reventar)
+    # si no aparece PT => full time
     return 1.0
-
 
 # =============================
 # Lectura Gestión
@@ -283,11 +291,12 @@ def read_gestion(path: Path) -> pd.DataFrame:
     df["STORE_KEY"] = df["GRUPO"].map(store_key)
 
     # CARGO (importante para el merge con agrupador)
-    if "CARGO" in df.columns:
-        df["CARGO"] = df["CARGO"].map(normalize_text)
-    else:
-        # si no existe, igual crea la columna para que no reviente
-        df["CARGO"] = ""
+    # dentro de read_gestion(...)
+    cargo_col = "CARGO" if "CARGO" in df.columns else find_col(df.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
+    if cargo_col and cargo_col != "CARGO":
+    df = df.rename(columns={cargo_col: "CARGO"})
+
+    df["CARGO"] = df["CARGO"].map(normalize_text) if "CARGO" in df.columns else ""
 
     # NO fijar FTE acá
     # df["FTE_TEORICO_PERSONA"] = 1.0  <-- QUITAR
@@ -516,6 +525,7 @@ def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd
 
 
 
+
 # =============================
 # Main
 # =============================
@@ -546,6 +556,27 @@ def main():
         "FECHA EGRESO": "FECHA DE EGRESO",
         "FTE AUT": "FTE TEORICO TIENDA",
     })
+    agr_cargos = read_agrupador_cargos(FILES["agrupador"])
+
+    # Traer AGRUPA CARGO + FTE_TEORICO_PERSONA desde el Agrupador
+    base = base.merge(agr_cargos, on="CARGO", how="left")
+
+    # Si algún cargo no matchea, por seguridad:
+    base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
+    base["AGRUPA CARGO"] = base["AGRUPA CARGO"].fillna(base["CARGO"])
+
+    # Debug útil (déjalo al principio hasta que todo calce)
+    no_match = base[base["AGRUPA CARGO"].isna() | base["FTE_TEORICO_PERSONA"].isna()]
+    print("Cargos sin match en Agrupador:", no_match["CARGO"].nunique())
+    print(no_match["CARGO"].value_counts().head(25))
+
+    # FTE teórico por persona desde CARGO (PTxx -> xx/44, sino 1.0)
+    # FTE teórico por persona desde CARGO
+    base["FTE_TEORICO_PERSONA"] = base["CARGO"].apply(fte_teorico_desde_cargo)
+    base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
+
+    print(base["FTE_TEORICO_PERSONA"].describe())
+    print(base[["CARGO","FTE_TEORICO_PERSONA"]].drop_duplicates().head(15).to_string(index=False))
 
 
     # (opcional) debug rápido
@@ -557,10 +588,7 @@ def main():
         "FTE AUT": "FTE TEORICO",
     })[["CECO", "GRUPO", "FTE TEORICO"]].copy()
 
-    # ...después de base.rename(...) y antes de aplicar_reglas...
-
-    base["FTE_TEORICO_PERSONA"] = base["CARGO"].apply(fte_teorico_desde_cargo)
-    base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
+      
 
 
     # Aplica reglas por persona (usa FTE_TEORICO_PERSONA como base)
