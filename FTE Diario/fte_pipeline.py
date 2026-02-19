@@ -522,7 +522,65 @@ def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd
     res = res[cols].sort_values(["CECO"])
 
     return res
+def read_agrupador_cargo_map(path: Path) -> pd.DataFrame:
+    # En tu Agrupador 9, la tabla real parte en header=4 y está en sheet "AGRUPADOR"
+    df = pd.read_excel(path, sheet_name="AGRUPADOR", header=4)
+    df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
 
+    cargo_col = find_col(df.columns, ["CARGO"])
+    agrupa_col = find_col(df.columns, ["AGRUPA CARGO"])
+    fte_col = find_col(df.columns, ["FTE TEORICO"])  # a veces viene
+
+    if not cargo_col or not agrupa_col:
+        raise ValueError(f"No encontré CARGO / AGRUPA CARGO en Agrupador. Columnas: {list(df.columns)}")
+
+    cols = [cargo_col, agrupa_col] + ([fte_col] if fte_col else [])
+    out = df[cols].copy()
+
+    out = out.rename(columns={
+        cargo_col: "CARGO",
+        agrupa_col: "AGRUPA_CARGO",
+        (fte_col or "___"): "FTE_TEORICO_AGRUPADOR"
+    })
+
+    out["CARGO"] = out["CARGO"].map(normalize_text)
+    out["AGRUPA_CARGO"] = out["AGRUPA_CARGO"].map(normalize_text)
+
+    if "FTE_TEORICO_AGRUPADOR" in out.columns:
+        out["FTE_TEORICO_AGRUPADOR"] = pd.to_numeric(out["FTE_TEORICO_AGRUPADOR"], errors="coerce")
+    else:
+        out["FTE_TEORICO_AGRUPADOR"] = pd.NA
+
+    out = out.dropna(subset=["CARGO", "AGRUPA_CARGO"])
+    out = out.drop_duplicates(subset=["CARGO"], keep="last")
+    return out[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_AGRUPADOR"]]
+
+def read_composicion_fte(path: Path) -> pd.DataFrame:
+    raw = pd.read_excel(path, sheet_name="COMPOSICION FTE", header=None)
+
+    # Encuentra la fila donde está el encabezado "CARGO" (col 1)
+    header_idx = None
+    for i in range(min(50, len(raw))):
+        v = raw.iloc[i, 1]
+        if isinstance(v, str) and v.strip().upper() == "CARGO":
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("No encontré encabezado 'CARGO' en sheet COMPOSICION FTE")
+
+    # Datos vienen justo debajo: col0=factor, col1=cargo
+    df = raw.iloc[header_idx + 1:, [0, 1]].copy()
+    df.columns = ["FTE_FACTOR", "AGRUPA_CARGO"]
+
+    df["AGRUPA_CARGO"] = df["AGRUPA_CARGO"].astype(str).map(normalize_text)
+    df["FTE_FACTOR"] = pd.to_numeric(df["FTE_FACTOR"], errors="coerce")
+
+    df = df.dropna(subset=["AGRUPA_CARGO", "FTE_FACTOR"])
+    df = df[~df["AGRUPA_CARGO"].str.contains(r"^FTE AUTORIZADO$|^CARGO$", regex=True, na=False)]
+    df = df.drop_duplicates(subset=["AGRUPA_CARGO"], keep="last")
+
+    df = df.rename(columns={"FTE_FACTOR": "FTE_TEORICO_PERSONA"})
+    return df[["AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
 
 
 
@@ -556,6 +614,26 @@ def main():
         "FECHA EGRESO": "FECHA DE EGRESO",
         "FTE AUT": "FTE TEORICO TIENDA",
     })
+    # === NUEVO: mapeo cargo -> agrupa cargo (agrupador) y agrupa cargo -> fte factor (fte autorizado) ===
+    agr_map = read_agrupador_cargo_map(FILES["agrupador"])
+    comp_map = read_composicion_fte(FILES["fte_aut"])
+
+    # 1) base(CARGO) -> AGRUPA_CARGO
+    base = base.merge(agr_map, on="CARGO", how="left")
+
+    # Debug: cargos sin mapeo en agrupador
+    sin_agr = base[base["AGRUPA_CARGO"].isna()]
+    print("CARGOS sin match en AGRUPADOR (top 20):")
+    print(sin_agr["CARGO"].value_counts().head(20).to_string())
+
+    # 2) base(AGRUPA_CARGO) -> FTE_TEORICO_PERSONA (desde COMPOSICION FTE)
+    base = base.merge(comp_map, on="AGRUPA_CARGO", how="left")
+
+    # Si por alguna razón faltó en COMPOSICION, usa el FTE del agrupador; y si igual falta, 1.0
+    base["FTE_TEORICO_PERSONA"] = base["FTE_TEORICO_PERSONA"].fillna(base["FTE_TEORICO_AGRUPADOR"]).fillna(1.0)
+
+    print(base["FTE_TEORICO_PERSONA"].describe())
+
     agr_cargos = read_agrupador_cargos(FILES["agrupador"])
 
     # Traer AGRUPA CARGO + FTE_TEORICO_PERSONA desde el Agrupador
