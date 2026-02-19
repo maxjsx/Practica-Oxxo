@@ -522,38 +522,41 @@ def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd
     res = res[cols].sort_values(["CECO"])
 
     return res
-def read_agrupador_cargo_map(path: Path) -> pd.DataFrame:
-    # En tu Agrupador 9, la tabla real parte en header=4 y está en sheet "AGRUPADOR"
+ddef read_agrupador_cargo_map(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name="AGRUPADOR", header=4)
     df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
 
-    cargo_col = find_col(df.columns, ["CARGO"])
-    agrupa_col = find_col(df.columns, ["AGRUPA CARGO"])
-    fte_col = find_col(df.columns, ["FTE TEORICO"])  # a veces viene
+    cargo_col  = "CARGO"
+    agrupa_col = "AGRUPA CARGO_2"
+    fte_col    = "FTE TEORICO"
 
-    if not cargo_col or not agrupa_col:
-        raise ValueError(f"No encontré CARGO / AGRUPA CARGO en Agrupador. Columnas: {list(df.columns)}")
+    for col in (cargo_col, agrupa_col, fte_col):
+        if col not in df.columns:
+            raise ValueError(f"Falta columna '{col}' en AGRUPADOR. Columnas: {list(df.columns)}")
 
-    cols = [cargo_col, agrupa_col] + ([fte_col] if fte_col else [])
-    out = df[cols].copy()
-
+    out = df[[cargo_col, agrupa_col, fte_col]].copy()
     out = out.rename(columns={
         cargo_col: "CARGO",
         agrupa_col: "AGRUPA_CARGO",
-        (fte_col or "___"): "FTE_TEORICO_AGRUPADOR"
+        fte_col: "FTE_AGRUPADOR",
     })
 
     out["CARGO"] = out["CARGO"].map(normalize_text)
     out["AGRUPA_CARGO"] = out["AGRUPA_CARGO"].map(normalize_text)
 
-    if "FTE_TEORICO_AGRUPADOR" in out.columns:
-        out["FTE_TEORICO_AGRUPADOR"] = pd.to_numeric(out["FTE_TEORICO_AGRUPADOR"], errors="coerce")
-    else:
-        out["FTE_TEORICO_AGRUPADOR"] = pd.NA
+    # OJO decimales con coma
+    out["FTE_AGRUPADOR"] = (
+        out["FTE_AGRUPADOR"]
+        .astype(str)
+        .str.replace(",", ".", regex=False)
+    )
+    out["FTE_AGRUPADOR"] = pd.to_numeric(out["FTE_AGRUPADOR"], errors="coerce")
 
-    out = out.dropna(subset=["CARGO", "AGRUPA_CARGO"])
+    out = out.dropna(subset=["CARGO", "AGRUPA_CARGO", "FTE_AGRUPADOR"])
+    out = out[out["FTE_AGRUPADOR"].between(0, 1.2)]
     out = out.drop_duplicates(subset=["CARGO"], keep="last")
-    return out[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_AGRUPADOR"]]
+    return out
+
 
 def read_composicion_fte(path: Path) -> pd.DataFrame:
     raw = pd.read_excel(path, sheet_name="COMPOSICION FTE", header=None)
@@ -614,51 +617,43 @@ def main():
         "FECHA EGRESO": "FECHA DE EGRESO",
         "FTE AUT": "FTE TEORICO TIENDA",
     })
-    # === NUEVO: mapeo cargo -> agrupa cargo (agrupador) y agrupa cargo -> fte factor (fte autorizado) ===
-    agr_map = read_agrupador_cargo_map(FILES["agrupador"])
-    comp_map = read_composicion_fte(FILES["fte_aut"])
 
-    # 1) base(CARGO) -> AGRUPA_CARGO
+    # ============================
+    # FTE persona: CARGO -> AGRUPA_CARGO -> FTE factor
+    # ============================
+    agr_map  = read_agrupador_cargo_map(FILES["agrupador"])   # CARGO -> AGRUPA_CARGO + FTE_AGRUPADOR
+    comp_map = read_composicion_fte(FILES["fte_aut"])         # AGRUPA_CARGO -> FTE_TEORICO_PERSONA
+
+    # 1) Gestión(CARGO) -> Agrupador(AGRUPA_CARGO, FTE_AGRUPADOR)
     base = base.merge(agr_map, on="CARGO", how="left")
 
     # Debug: cargos sin mapeo en agrupador
     sin_agr = base[base["AGRUPA_CARGO"].isna()]
-    print("CARGOS sin match en AGRUPADOR (top 20):")
+    print("\nCARGOS sin match en AGRUPADOR (top 20):")
     print(sin_agr["CARGO"].value_counts().head(20).to_string())
 
-    # 2) base(AGRUPA_CARGO) -> FTE_TEORICO_PERSONA (desde COMPOSICION FTE)
+    # 2) Agrupador(AGRUPA_CARGO) -> Composición(FTE_TEORICO_PERSONA)
     base = base.merge(comp_map, on="AGRUPA_CARGO", how="left")
 
-    # Si por alguna razón faltó en COMPOSICION, usa el FTE del agrupador; y si igual falta, 1.0
-    base["FTE_TEORICO_PERSONA"] = base["FTE_TEORICO_PERSONA"].fillna(base["FTE_TEORICO_AGRUPADOR"]).fillna(1.0)
-
-    print(base["FTE_TEORICO_PERSONA"].describe())
-
-    agr_cargos = read_agrupador_cargos(FILES["agrupador"])
-
-    # Traer AGRUPA CARGO + FTE_TEORICO_PERSONA desde el Agrupador
-    base = base.merge(agr_cargos, on="CARGO", how="left")
-
-    # Si algún cargo no matchea, por seguridad:
-    base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
-    base["AGRUPA CARGO"] = base["AGRUPA CARGO"].fillna(base["CARGO"])
-
-    # Debug útil (déjalo al principio hasta que todo calce)
-    no_match = base[base["AGRUPA CARGO"].isna() | base["FTE_TEORICO_PERSONA"].isna()]
-    print("Cargos sin match en Agrupador:", no_match["CARGO"].nunique())
-    print(no_match["CARGO"].value_counts().head(25))
-
-    # FTE teórico por persona desde CARGO (PTxx -> xx/44, sino 1.0)
-    # FTE teórico por persona desde CARGO
-    base["FTE_TEORICO_PERSONA"] = base["CARGO"].apply(fte_teorico_desde_cargo)
+    # 3) Fallbacks: si no está en COMPOSICION, usa el FTE del agrupador; si igual falta => 1.0
+    base["FTE_TEORICO_PERSONA"] = (
+        base["FTE_TEORICO_PERSONA"]
+        .fillna(base["FTE_AGRUPADOR"])
+        .fillna(1.0)
+    )
     base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
+    print("\nFTE_TEORICO_PERSONA describe:")
     print(base["FTE_TEORICO_PERSONA"].describe())
-    print(base[["CARGO","FTE_TEORICO_PERSONA"]].drop_duplicates().head(15).to_string(index=False))
 
-
-    # (opcional) debug rápido
-    # print("Cargos sin match:", base.loc[base["FTE_TEORICO_PERSONA"].isna(), "CARGO"].value_counts().head(20))
+    # Debug: confirma que hay PT (<1)
+    print("\nEjemplos CARGO / AGRUPA_CARGO / FTE_TEORICO_PERSONA (15):")
+    print(
+        base[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
+        .drop_duplicates()
+        .head(15)
+        .to_string(index=False)
+    )
 
     # Universo tiendas
     universo = fte_aut.rename(columns={
@@ -666,10 +661,7 @@ def main():
         "FTE AUT": "FTE TEORICO",
     })[["CECO", "GRUPO", "FTE TEORICO"]].copy()
 
-      
-
-
-    # Aplica reglas por persona (usa FTE_TEORICO_PERSONA como base)
+    # Aplica reglas por persona
     base_persona = aplicar_reglas_fte_persona(base, permisos, inclusion)
 
     # Resumen final
@@ -687,8 +679,7 @@ def main():
         resumen.to_excel(writer, index=False, sheet_name="RESUMEN_TIENDAS")
         pivot.to_excel(writer, index=False, sheet_name="PIVOT")
 
-    print(f"OK -> {out_path}")
-
+    print(f"\nOK -> {out_path}")
 
 
 if __name__ == "__main__":
