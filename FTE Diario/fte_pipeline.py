@@ -591,25 +591,24 @@ def read_composicion_fte(path: Path) -> pd.DataFrame:
 # Main
 # =============================
 def main():
-    gestion = read_gestion(FILES["gestion"])
-    activos = read_activos(FILES["activos"])
-    bajas = read_bajas(FILES["bajas"])
-    permisos = read_permisos(FILES["permisos"])
+    gestion   = read_gestion(FILES["gestion"])
+    activos   = read_activos(FILES["activos"])
+    bajas     = read_bajas(FILES["bajas"])
+    permisos  = read_permisos(FILES["permisos"])
     inclusion = read_talana_inclusion(FILES["talana"])
 
-    # FTE Autorizado
+    # ========= FTE Autorizado (tiendas) =========
     xls = pd.ExcelFile(FILES["fte_aut"])
     month_sheet = pick_latest_month_sheet(xls.sheet_names)
     fte_aut = read_fte_aut_sheet(FILES["fte_aut"], sheet_name=month_sheet)
 
-    # Base: Gestión -> CECO por STORE_KEY
+    # ========= Base: Gestion -> CECO =========
     base = gestion.merge(
         fte_aut[["CECO", "STORE_KEY", "FTE AUT"]],
         on="STORE_KEY",
         how="left"
     )
 
-    # fechas por RUT
     base = base.merge(activos, on="RUT", how="left")
     base = base.merge(bajas, on="RUT", how="left")
     base = base.rename(columns={
@@ -618,53 +617,44 @@ def main():
         "FTE AUT": "FTE TEORICO TIENDA",
     })
 
-    # ============================
-    # FTE persona: CARGO -> AGRUPA_CARGO -> FTE factor
-    # ============================
-    agr_map  = read_agrupador_cargo_map(FILES["agrupador"])   # CARGO -> AGRUPA_CARGO + FTE_AGRUPADOR
-    comp_map = read_composicion_fte(FILES["fte_aut"])         # AGRUPA_CARGO -> FTE_TEORICO_PERSONA
+    # ========= Mapeos cargos -> FTE teórico persona =========
+    agr_map  = read_agrupador_cargo_map(FILES["agrupador"])  # CARGO -> AGRUPA_CARGO (+ opcional FTE_AGRUPADOR)
+    comp_map = read_composicion_fte(FILES["fte_aut"])        # AGRUPA_CARGO -> FTE_TEORICO_PERSONA
 
-    # 1) Gestión(CARGO) -> Agrupador(AGRUPA_CARGO, FTE_AGRUPADOR)
+    # 1) Gestión(CARGO) -> Agrupador(AGRUPA_CARGO)
     base = base.merge(agr_map, on="CARGO", how="left")
 
-    # Debug: cargos sin mapeo en agrupador
-    sin_agr = base[base["AGRUPA_CARGO"].isna()]
-    print("\nCARGOS sin match en AGRUPADOR (top 20):")
-    print(sin_agr["CARGO"].value_counts().head(20).to_string())
+    # TOP 20 cargos sin match (para que me los pegues)
+    sin_agr = base.loc[base["AGRUPA_CARGO"].isna(), "CARGO"].value_counts().head(20)
+    print("\n=== TOP 20 CARGOS SIN MATCH EN AGRUPADOR ===")
+    print(sin_agr.to_string())
+    print("===========================================\n", flush=True)
 
-    # 2) Agrupador(AGRUPA_CARGO) -> Composición(FTE_TEORICO_PERSONA)
+    # 2) Agrupador(AGRUPA_CARGO) -> Composición(FTE factor)
     base = base.merge(comp_map, on="AGRUPA_CARGO", how="left")
 
-    # 3) Fallbacks: si no está en COMPOSICION, usa el FTE del agrupador; si igual falta => 1.0
-    base["FTE_TEORICO_PERSONA"] = (
-        base["FTE_TEORICO_PERSONA"]
-        .fillna(base["FTE_AGRUPADOR"])
-        .fillna(1.0)
-    )
+    # 3) Fallbacks (solo si faltó en composición)
+    #    - si agr_map trae FTE_AGRUPADOR úsalo
+    #    - si no existe, cae a 1.0
+    if "FTE_AGRUPADOR" in base.columns:
+        base["FTE_TEORICO_PERSONA"] = base["FTE_TEORICO_PERSONA"].fillna(base["FTE_AGRUPADOR"])
+
     base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
-    print("\nFTE_TEORICO_PERSONA describe:")
-    print(base["FTE_TEORICO_PERSONA"].describe())
+    # Debug rápido: distribución
+    print("FTE_TEORICO_PERSONA describe:")
+    print(base["FTE_TEORICO_PERSONA"].describe(), flush=True)
 
-    # Debug: confirma que hay PT (<1)
-    print("\nEjemplos CARGO / AGRUPA_CARGO / FTE_TEORICO_PERSONA (15):")
-    print(
-        base[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
-        .drop_duplicates()
-        .head(15)
-        .to_string(index=False)
-    )
-
-    # Universo tiendas
+    # ========= Universo tiendas =========
     universo = fte_aut.rename(columns={
         "NOMBRE_DISPLAY": "GRUPO",
         "FTE AUT": "FTE TEORICO",
     })[["CECO", "GRUPO", "FTE TEORICO"]].copy()
 
-    # Aplica reglas por persona
+    # ========= Reglas por persona =========
     base_persona = aplicar_reglas_fte_persona(base, permisos, inclusion)
 
-    # Resumen final
+    # ========= Resumen =========
     resumen = resumen_por_tienda(base_persona, universo)
 
     pivot = resumen.pivot_table(
@@ -673,13 +663,17 @@ def main():
         aggfunc="sum"
     ).reset_index()
 
-    out_path = OUTPUT / "FTE_resultado.xlsx"
+    # ========= Export =========
+    # Tip: nombre con fecha para evitar PermissionError si el archivo está abierto
+    out_path = OUTPUT / f"FTE_resultado_{TODAY.strftime('%Y-%m-%d')}.xlsx"
+
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         base_persona.to_excel(writer, index=False, sheet_name="BASE_PERSONA")
         resumen.to_excel(writer, index=False, sheet_name="RESUMEN_TIENDAS")
         pivot.to_excel(writer, index=False, sheet_name="PIVOT")
 
-    print(f"\nOK -> {out_path}")
+    print(f"OK -> {out_path}")
+
 
 
 if __name__ == "__main__":
