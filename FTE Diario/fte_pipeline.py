@@ -617,31 +617,46 @@ def main():
         "FTE AUT": "FTE TEORICO TIENDA",
     })
 
-    # ========= Mapeos cargos -> FTE teórico persona =========
-    agr_map  = read_agrupador_cargo_map(FILES["agrupador"])  # CARGO -> AGRUPA_CARGO (+ opcional FTE_AGRUPADOR)
+    # ========= 0) CARGO desde Talana (esto es lo que faltaba) =========
+    tal = pd.read_excel(FILES["talana"])
+    tal.columns = [str(c).strip().upper().replace("\xa0", " ") for c in tal.columns]
+
+    rut_col   = find_col(tal.columns, ["RUT", "RUN", "NATIONAL ID", "IDENTIFICADOR"])
+    cargo_col = find_col(tal.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
+
+    if not rut_col or not cargo_col:
+        raise ValueError(f"No encontré columnas RUT/CARGO en Talana. Columnas: {list(tal.columns)}")
+
+    tal_cargos = tal[[rut_col, cargo_col]].copy()
+    tal_cargos = tal_cargos.rename(columns={rut_col: "RUT", cargo_col: "CARGO"})
+    tal_cargos["RUT"] = tal_cargos["RUT"].map(normalize_rut)
+    tal_cargos["CARGO"] = tal_cargos["CARGO"].map(normalize_text)
+    tal_cargos = tal_cargos.dropna(subset=["RUT"]).drop_duplicates(subset=["RUT"], keep="last")
+
+    base = base.merge(tal_cargos, on="RUT", how="left")
+    base["CARGO"] = base["CARGO"].fillna("").map(normalize_text)
+
+    # ========= 1) Mapeos =========
+    agr_map  = read_agrupador_cargo_map(FILES["agrupador"])  # CARGO -> AGRUPA_CARGO + FTE_AGRUPADOR
     comp_map = read_composicion_fte(FILES["fte_aut"])        # AGRUPA_CARGO -> FTE_TEORICO_PERSONA
 
-    # 1) Gestión(CARGO) -> Agrupador(AGRUPA_CARGO)
+    # 1a) CARGO -> AGRUPA_CARGO (Agrupador)
     base = base.merge(agr_map, on="CARGO", how="left")
 
-    # TOP 20 cargos sin match (para que me los pegues)
-    sin_agr = base.loc[base["AGRUPA_CARGO"].isna(), "CARGO"].value_counts().head(20)
+    sin_agr = base.loc[base["AGRUPA_CARGO"].isna() & (base["CARGO"] != ""), "CARGO"].value_counts().head(20)
     print("\n=== TOP 20 CARGOS SIN MATCH EN AGRUPADOR ===")
     print(sin_agr.to_string())
     print("===========================================\n", flush=True)
 
-    # 2) Agrupador(AGRUPA_CARGO) -> Composición(FTE factor)
+    # 1b) AGRUPA_CARGO -> FTE_TEORICO_PERSONA (Composición FTE)
     base = base.merge(comp_map, on="AGRUPA_CARGO", how="left")
 
-    # 3) Fallbacks (solo si faltó en composición)
-    #    - si agr_map trae FTE_AGRUPADOR úsalo
-    #    - si no existe, cae a 1.0
+    # 2) Fallbacks
     if "FTE_AGRUPADOR" in base.columns:
         base["FTE_TEORICO_PERSONA"] = base["FTE_TEORICO_PERSONA"].fillna(base["FTE_AGRUPADOR"])
 
     base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
-    # Debug rápido: distribución
     print("FTE_TEORICO_PERSONA describe:")
     print(base["FTE_TEORICO_PERSONA"].describe(), flush=True)
 
@@ -664,9 +679,7 @@ def main():
     ).reset_index()
 
     # ========= Export =========
-    # Tip: nombre con fecha para evitar PermissionError si el archivo está abierto
-    out_path = OUTPUT / f"FTE_resultado_{TODAY.strftime('%Y-%m-%d')}.xlsx"
-
+    out_path = OUTPUT / f"FTE_resultado_{TODAY.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         base_persona.to_excel(writer, index=False, sheet_name="BASE_PERSONA")
         resumen.to_excel(writer, index=False, sheet_name="RESUMEN_TIENDAS")
