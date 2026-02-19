@@ -657,6 +657,21 @@ def main():
 
     base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
+    print("\n=== CHECK 1: describe FTE_TEORICO_PERSONA ===")
+    print(base["FTE_TEORICO_PERSONA"].describe())
+    print("\nValores más comunes (top 15):")
+    print(base["FTE_TEORICO_PERSONA"].value_counts().head(15).to_string())
+
+    print("\nEjemplos (CARGO / AGRUPA_CARGO / FTE):")
+    print(
+        base[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
+        .drop_duplicates()
+        .head(25)
+        .to_string(index=False)
+    )
+    print("=============================================\n", flush=True)
+
+
     print("FTE_TEORICO_PERSONA describe:")
     print(base["FTE_TEORICO_PERSONA"].describe(), flush=True)
 
