@@ -40,7 +40,7 @@ FILES = {
     "talana": pick_one("Lista*Empleados_Talana*.xls*"),
     "permisos": pick_one("PermisosAsignados*.xls*"),
     "fte_aut": pick_one("00 - FTE AUTORIZADO*.xls*"),
-    "agrupador": pick_one("Agrupador 9*.xls*"),
+    "agrupador": pick_one("Agrupador 5*.xls*"),
 
 }
 
