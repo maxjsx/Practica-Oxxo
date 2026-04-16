@@ -5,7 +5,6 @@ import unicodedata
 from pathlib import Path
 import pandas as pd
 
-
 # =============================
 # Config
 # =============================
@@ -16,7 +15,7 @@ INPUT = ROOT / "input"
 OUTPUT = ROOT / "output"
 OUTPUT.mkdir(exist_ok=True)
 
-TODAY = pd.Timestamp.today().normalize()  # si quieres fijarlo: pd.Timestamp("2026-02-05")
+TODAY = pd.Timestamp.today().normalize()  # puedes fijarlo: pd.Timestamp("2026-02-05")
 
 print("INPUT =", INPUT)
 print("=== Archivos reales en input ===")
@@ -41,7 +40,6 @@ FILES = {
     "permisos": pick_one("PermisosAsignados*.xls*"),
     "fte_aut": pick_one("00 - FTE AUTORIZADO*.xls*"),
     "agrupador": pick_one("Agrupador 5*.xls*"),
-
 }
 
 print("=== Archivos seleccionados ===")
@@ -100,8 +98,7 @@ def clean_display_name(x) -> str:
 
 
 def find_col(cols, must_contain_any):
-    """Devuelve la primera columna cuyo nombre contenga alguno de los tokens."""
-    ucols = [c.upper() for c in cols]
+    ucols = [str(c).upper() for c in cols]
     for token in must_contain_any:
         for i, c in enumerate(ucols):
             if token in c:
@@ -110,7 +107,7 @@ def find_col(cols, must_contain_any):
 
 
 # =============================
-# Lectura FTE Autorizado
+# Lectura FTE Autorizado (tiendas)
 # =============================
 def pick_latest_month_sheet(sheet_names: list[str]) -> str:
     months = {
@@ -130,9 +127,6 @@ def pick_latest_month_sheet(sheet_names: list[str]) -> str:
                     best = cand
     if best:
         return best[2]
-    for name in sheet_names:
-        if "_" in str(name):
-            return name
     return sheet_names[0]
 
 
@@ -141,10 +135,7 @@ def read_fte_aut_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
 
     header_row = None
     for i in range(min(200, len(raw))):
-        row_vals = []
-        for v in raw.iloc[i].tolist():
-            row_vals.append("" if pd.isna(v) else str(v).strip().upper())
-
+        row_vals = [("" if pd.isna(v) else str(v).strip().upper()) for v in raw.iloc[i].tolist()]
         has_ceco = any(v == "CECO" for v in row_vals)
         has_maestra = any("NOMBRE MAESTRA" in v for v in row_vals)
         if has_ceco and has_maestra:
@@ -167,7 +158,6 @@ def read_fte_aut_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
     df["NOMBRE MAESTRA"] = df["NOMBRE MAESTRA"].map(normalize_text)
     df["FTE AUT"] = pd.to_numeric(df["FTE AUT"], errors="coerce")
 
-    # Limpieza: CECO válido + FTE válido
     df = df[df["CECO"].str.match(r"^[A-Z0-9]{4,6}$", na=False)]
     df = df[df["NOMBRE MAESTRA"].astype(str).str.len() > 0]
     df = df[df["FTE AUT"].notna()]
@@ -176,104 +166,80 @@ def read_fte_aut_sheet(path: Path, sheet_name: str) -> pd.DataFrame:
     df["STORE_KEY"] = df["NOMBRE MAESTRA"].map(store_key)
     df["NOMBRE_DISPLAY"] = df["NOMBRE MAESTRA"].map(clean_display_name)
 
-    # dedup por CECO (por si viene repetido)
     df = df.drop_duplicates(subset=["CECO"], keep="last").copy()
 
-    # IMPORTANTE: si quieres limitar a “tiendas reales”:
+    # si quieres limitar a tiendas reales:
     df = df[df["CECO"].str.match(r"^50[A-Z0-9]{3}$", na=False)].copy()
 
     return df
 
-def read_agrupador_cargos(path: Path) -> pd.DataFrame:
-    # Leemos sin header para encontrar la fila donde realmente empieza la tabla
-    raw = pd.read_excel(path, sheet_name="AGRUPADOR", header=None)
 
-    header_row = None
-    for i in range(min(200, len(raw))):
-        row = [("" if pd.isna(v) else str(v).strip().upper()) for v in raw.iloc[i].tolist()]
-        if "CARGO" in row and any("FTE" in v for v in row):
-            header_row = i
-            break
-
-    if header_row is None:
-        raise ValueError("No encontré la fila header de la tabla de cargos (busqué 'CARGO' y algo con 'FTE').")
-
-    df = pd.read_excel(path, sheet_name="AGRUPADOR", header=header_row)
+# =============================
+# Agrupador 5: CARGO -> AGRUPA_CARGO y FTE base (fallback)
+# =============================
+def read_agrupador_cargo_map(path: Path) -> pd.DataFrame:
+    # IMPORTANTE: header=4 puede variar. Si te falla, lo ajustamos.
+    df = pd.read_excel(path, sheet_name="AGRUPADOR", header=4)
     df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
 
-    # Columnas que necesitamos (en tu archivo suele venir como 'AGRUPA CARGO_2')
-    cargo_col = "CARGO" if "CARGO" in df.columns else find_col(df.columns, ["CARGO"])
-    agrupa_col = find_col(df.columns, ["AGRUPA CARGO"])
-    fte_col = find_col(df.columns, ["FTE TEORICO", "FTE TEORI", "FTE"])
+    cargo_col  = "CARGO" if "CARGO" in df.columns else find_col(df.columns, ["CARGO"])
+    agrupa_col = "AGRUPA CARGO_2" if "AGRUPA CARGO_2" in df.columns else find_col(df.columns, ["AGRUPA CARGO"])
+    fte_col    = "FTE TEORICO" if "FTE TEORICO" in df.columns else find_col(df.columns, ["FTE TEORICO", "FTE"])
 
     if not cargo_col or not agrupa_col or not fte_col:
-        raise ValueError(f"No encontré columnas esperadas en la tabla de cargos. Columnas: {list(df.columns)}")
+        raise ValueError(f"Faltan columnas en AGRUPADOR. Detectado: CARGO={cargo_col}, AGRUPA={agrupa_col}, FTE={fte_col}. Columnas: {list(df.columns)}")
 
     out = df[[cargo_col, agrupa_col, fte_col]].copy()
     out = out.rename(columns={
         cargo_col: "CARGO",
-        agrupa_col: "AGRUPA CARGO",
-        fte_col: "FTE_TEORICO_PERSONA"
+        agrupa_col: "AGRUPA_CARGO",
+        fte_col: "FTE_AGRUPADOR",
     })
 
     out["CARGO"] = out["CARGO"].map(normalize_text)
-    out["AGRUPA CARGO"] = out["AGRUPA CARGO"].map(normalize_text)
-    out["FTE_TEORICO_PERSONA"] = pd.to_numeric(out["FTE_TEORICO_PERSONA"], errors="coerce")
+    out["AGRUPA_CARGO"] = out["AGRUPA_CARGO"].map(normalize_text)
 
-    out = out.dropna(subset=["CARGO", "FTE_TEORICO_PERSONA"])
-    out = out[out["FTE_TEORICO_PERSONA"].between(0, 1.2)]  # limpieza
+    out["FTE_AGRUPADOR"] = (
+        out["FTE_AGRUPADOR"]
+        .astype(str)
+        .str.replace(",", ".", regex=False)
+    )
+    out["FTE_AGRUPADOR"] = pd.to_numeric(out["FTE_AGRUPADOR"], errors="coerce")
+
+    out = out.dropna(subset=["CARGO", "AGRUPA_CARGO", "FTE_AGRUPADOR"])
+    out = out[out["FTE_AGRUPADOR"].between(0, 1.2)]
     out = out.drop_duplicates(subset=["CARGO"], keep="last")
-
     return out
 
 
-def read_agrupador_inclusion(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="INCLS", header=3)
-    df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
+# =============================
+# COMPOSICION FTE (en 00 - FTE AUTORIZADO): AGRUPA_CARGO -> FTE_TEORICO_PERSONA
+# =============================
+def read_composicion_fte(path: Path) -> pd.DataFrame:
+    raw = pd.read_excel(path, sheet_name="COMPOSICION FTE", header=None)
 
-    # Columnas reales en tu archivo: Identificador, AGRUPA CARGO, FTE INCLS, etc.
-    rut_col = "IDENTIFICADOR" if "IDENTIFICADOR" in df.columns else find_col(df.columns, ["IDENTIFICADOR", "RUT", "RUN"])
-    fte_col = "FTE INCLS" if "FTE INCLS" in df.columns else find_col(df.columns, ["FTE INCLS", "INCLS", "FTE"])
+    header_idx = None
+    for i in range(min(80, len(raw))):
+        v = raw.iloc[i, 1] if raw.shape[1] > 1 else None
+        if isinstance(v, str) and v.strip().upper() == "CARGO":
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("No encontré encabezado 'CARGO' en sheet COMPOSICION FTE")
 
-    if not rut_col or not fte_col:
-        raise ValueError(f"No encontré Identificador / FTE INCLS en INCLS. Columnas: {list(df.columns)}")
+    df = raw.iloc[header_idx + 1:, [0, 1]].copy()
+    df.columns = ["FTE_FACTOR", "AGRUPA_CARGO"]
 
-    out = df[[rut_col, fte_col]].copy()
-    out = out.rename(columns={rut_col: "RUT", fte_col: "FTE_INCLUSION"})
-    out["RUT"] = out["RUT"].map(normalize_rut)
-    out["FTE_INCLUSION"] = pd.to_numeric(out["FTE_INCLUSION"], errors="coerce")
+    df["AGRUPA_CARGO"] = df["AGRUPA_CARGO"].astype(str).map(normalize_text)
+    df["FTE_FACTOR"] = pd.to_numeric(df["FTE_FACTOR"], errors="coerce")
 
-    out = out.dropna(subset=["RUT", "FTE_INCLUSION"])
-    return out.drop_duplicates(subset=["RUT"], keep="last")
+    df = df.dropna(subset=["AGRUPA_CARGO", "FTE_FACTOR"])
+    df = df[~df["AGRUPA_CARGO"].str.contains(r"^FTE AUTORIZADO$|^CARGO$", regex=True, na=False)]
+    df = df.drop_duplicates(subset=["AGRUPA_CARGO"], keep="last")
 
+    df = df.rename(columns={"FTE_FACTOR": "FTE_TEORICO_PERSONA"})
+    return df[["AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
 
-def fte_teorico_desde_cargo(cargo) -> float:
-    """
-    Regla:
-    - Si CARGO contiene PT + horas (20/25/30/etc) => horas/44
-    - Si NO contiene PT => 1.0
-    """
-    c = normalize_text(cargo)  # ya deja MAYUS + espacios normalizados
-
-    # 1) PT30 / PT 30 / PT-30 / PT 30 HRS / PT30HRS
-    m = re.search(r"\bPT\s*[-]?\s*(\d{1,2})\b", c)
-    if not m:
-        m = re.search(r"\bPT(\d{1,2})\b", c)
-    if not m:
-        m = re.search(r"\bPT\s*[-]?\s*(\d{1,2})\s*(HRS|HORAS)?\b", c)
-
-    # 2) PART TIME 30
-    if not m:
-        m = re.search(r"\bPART\s*TIME\s*(\d{1,2})\b", c)
-
-    if m:
-        horas = int(m.group(1))
-        # por seguridad: solo horas razonables
-        if 1 <= horas <= 44:
-            return round(horas / 44.0, 6)
-
-    # si no aparece PT => full time
-    return 1.0
 
 # =============================
 # Lectura Gestión
@@ -290,18 +256,17 @@ def read_gestion(path: Path) -> pd.DataFrame:
     df["GRUPO"] = df["GRUPO"].map(normalize_text)
     df["STORE_KEY"] = df["GRUPO"].map(store_key)
 
-    # CARGO (importante para el merge con agrupador)
-    # dentro de read_gestion(...)
+    # CARGO si viene en Gestión (si no, lo traeremos desde Talana igual)
     cargo_col = "CARGO" if "CARGO" in df.columns else find_col(df.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
     if cargo_col and cargo_col != "CARGO":
-    df = df.rename(columns={cargo_col: "CARGO"})
+        df = df.rename(columns={cargo_col: "CARGO"})
 
-    df["CARGO"] = df["CARGO"].map(normalize_text) if "CARGO" in df.columns else ""
+    if "CARGO" in df.columns:
+        df["CARGO"] = df["CARGO"].map(normalize_text)
+    else:
+        df["CARGO"] = ""
 
-    # NO fijar FTE acá
-    # df["FTE_TEORICO_PERSONA"] = 1.0  <-- QUITAR
     return df
-
 
 
 # =============================
@@ -322,7 +287,7 @@ def read_bajas(path: Path) -> pd.DataFrame:
     out = out.rename(columns={rut_col: "RUT", egreso_col: "FECHA EGRESO"})
     out["RUT"] = out["RUT"].map(normalize_rut)
     out["FECHA EGRESO"] = pd.to_datetime(out["FECHA EGRESO"], errors="coerce")
-    return out
+    return out.dropna(subset=["RUT"]).drop_duplicates(subset=["RUT"], keep="last")
 
 
 def read_activos(path: Path) -> pd.DataFrame:
@@ -340,45 +305,57 @@ def read_activos(path: Path) -> pd.DataFrame:
     out = out.rename(columns={rut_col: "RUT", ingreso_col: "FECHA INGRESO"})
     out["RUT"] = out["RUT"].map(normalize_rut)
     out["FECHA INGRESO"] = pd.to_datetime(out["FECHA INGRESO"], errors="coerce")
-    return out
+    return out.dropna(subset=["RUT"]).drop_duplicates(subset=["RUT"], keep="last")
 
 
 # =============================
-# Lectura Talana (Inclusión)
+# Talana: Inclusión y Cargo
 # =============================
 def read_talana_inclusion(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path)
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
 
-    rut_col = find_col(df.columns, ["RUT", "RUN", "NATIONAL ID"])
+    rut_col = find_col(df.columns, ["RUT", "RUN", "NATIONAL ID", "IDENTIFICADOR"])
     if not rut_col:
-        print("Aviso: No encontré columna RUT en Talana. Columnas:", list(df.columns))
         return pd.DataFrame(columns=["RUT", "FTE_INCLUSION"])
 
-    # Busca una columna que diga INCLUSION y/o FTE
     incl_col = find_col(df.columns, ["FTE INCLUSION", "INCLUSION FTE", "INCLUSION"])
     if not incl_col:
-        # si no existe, devuelve vacío (no rompe)
         return pd.DataFrame(columns=["RUT", "FTE_INCLUSION"])
 
     out = df[[rut_col, incl_col]].copy()
     out = out.rename(columns={rut_col: "RUT", incl_col: "FTE_INCLUSION"})
     out["RUT"] = out["RUT"].map(normalize_rut)
     out["FTE_INCLUSION"] = pd.to_numeric(out["FTE_INCLUSION"], errors="coerce")
-    out = out.dropna(subset=["RUT"])
-    out = out.dropna(subset=["FTE_INCLUSION"])
-    return out[["RUT", "FTE_INCLUSION"]].drop_duplicates(subset=["RUT"], keep="last")
+    out = out.dropna(subset=["RUT", "FTE_INCLUSION"]).drop_duplicates(subset=["RUT"], keep="last")
+    return out[["RUT", "FTE_INCLUSION"]]
+
+
+def read_talana_cargos(path: Path) -> pd.DataFrame:
+    df = pd.read_excel(path)
+    df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
+
+    rut_col = find_col(df.columns, ["RUT", "RUN", "NATIONAL ID", "IDENTIFICADOR"])
+    cargo_col = find_col(df.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
+
+    if not rut_col or not cargo_col:
+        raise ValueError(f"No encontré columnas RUT/CARGO en Talana. Columnas: {list(df.columns)}")
+
+    out = df[[rut_col, cargo_col]].copy()
+    out = out.rename(columns={rut_col: "RUT", cargo_col: "CARGO"})
+    out["RUT"] = out["RUT"].map(normalize_rut)
+    out["CARGO"] = out["CARGO"].map(normalize_text)
+    out = out.dropna(subset=["RUT"]).drop_duplicates(subset=["RUT"], keep="last")
+    return out
 
 
 # =============================
-# Lectura Permisos (Vacaciones / Licencias)
+# Permisos
 # =============================
 def read_permisos(path: Path) -> pd.DataFrame:
     df = pd.read_excel(path)
     df.columns = [str(c).strip().upper() for c in df.columns]
 
-    # En tu archivo existen exactamente estas:
-    # RUT, TIPO PERMISO, FECHA INICIO, FECHA FIN
     rut_col = "RUT" if "RUT" in df.columns else find_col(df.columns, ["RUT", "RUN", "NATIONAL ID", "IDENTIFICADOR"])
     tipo_col = "TIPO PERMISO" if "TIPO PERMISO" in df.columns else find_col(df.columns, ["TIPO", "MOTIVO", "PERMISO", "AUSENCIA", "CLASE"])
     ini_col = "FECHA INICIO" if "FECHA INICIO" in df.columns else find_col(df.columns, ["INICIO", "DESDE", "START"])
@@ -386,8 +363,6 @@ def read_permisos(path: Path) -> pd.DataFrame:
 
     if not rut_col or not tipo_col or not ini_col or not fin_col:
         print("Aviso: PermisosAsignados no calza (me faltan columnas). Columnas:", list(df.columns))
-        print("Detectado:", [("RUT", rut_col), ("TIPO", tipo_col), ("INICIO", ini_col), ("FIN", fin_col)])
-        # devolvemos esquema estándar vacío (para que no reviente)
         return pd.DataFrame(columns=["RUT", "TIPO", "FECHA_INICIO", "FECHA_FIN", "DURACION_INICIAL"])
 
     out = df[[rut_col, tipo_col, ini_col, fin_col]].copy()
@@ -404,9 +379,6 @@ def read_permisos(path: Path) -> pd.DataFrame:
     out["FECHA_INICIO"] = pd.to_datetime(out["FECHA_INICIO"], errors="coerce", dayfirst=True).dt.normalize()
     out["FECHA_FIN"] = pd.to_datetime(out["FECHA_FIN"], errors="coerce", dayfirst=True).dt.normalize()
 
-
-    # Calcula duración inicial en días (inclusive)
-    # Si FECHA_FIN viene vacía, dejamos NaN (no podemos calcular duración)
     dur = (out["FECHA_FIN"] - out["FECHA_INICIO"]).dt.days + 1
     out["DURACION_INICIAL"] = dur
 
@@ -415,25 +387,14 @@ def read_permisos(path: Path) -> pd.DataFrame:
 
 
 def permisos_vigentes_hoy(permisos: pd.DataFrame) -> pd.DataFrame:
-    """devuelve 1 fila por RUT con el 'permiso vigente' (si hay varios, toma el más largo o el más reciente)."""
     if permisos.empty:
         return pd.DataFrame(columns=["RUT", "TIPO", "FECHA_INICIO", "FECHA_FIN", "DURACION_INICIAL", "VIGENTE_HOY"])
 
     p = permisos.copy()
-
-    # vigente: inicio <= hoy y (fin es NaT o fin >= hoy)
     p["VIGENTE_HOY"] = (p["FECHA_INICIO"].notna()) & (p["FECHA_INICIO"] <= TODAY) & (
         p["FECHA_FIN"].isna() | (p["FECHA_FIN"] >= TODAY)
     )
 
-    # si fin < hoy => no vigente
-    # Nos quedamos con todos (porque la regla dice: si ya terminó, se comporta normal)
-    # pero para evaluar licencia>15 vigente, usamos VIGENTE_HOY.
-
-    # Si hay varias filas por RUT, priorizamos:
-    # 1) Vigente hoy primero
-    # 2) Mayor duración inicial
-    # 3) Fecha inicio más reciente
     p["_vig"] = p["VIGENTE_HOY"].astype(int)
     p = p.sort_values(by=["RUT", "_vig", "DURACION_INICIAL", "FECHA_INICIO"], ascending=[True, False, False, False])
     p = p.drop_duplicates(subset=["RUT"], keep="first").drop(columns=["_vig"])
@@ -441,45 +402,36 @@ def permisos_vigentes_hoy(permisos: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================
-# Cálculo FTE por persona (reglas)
+# Reglas FTE por persona
 # =============================
 def aplicar_reglas_fte_persona(base: pd.DataFrame,
                               permisos: pd.DataFrame,
                               inclusion: pd.DataFrame) -> pd.DataFrame:
     out = base.copy()
 
-    # 1) merge permisos (1 por RUT)
     p = permisos_vigentes_hoy(permisos)
     out = out.merge(p[["RUT", "TIPO", "VIGENTE_HOY", "DURACION_INICIAL"]], on="RUT", how="left")
 
-    # 2) merge inclusion
     if not inclusion.empty:
         out = out.merge(inclusion, on="RUT", how="left")
     else:
         out["FTE_INCLUSION"] = pd.NA
 
-    # Normalizaciones
     out["FTE_TEORICO_PERSONA"] = pd.to_numeric(out["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
-    # Flags
     out["ES_INCLUSION"] = out["FTE_INCLUSION"].notna()
 
-    # Detecta licencia / vacaciones por texto
     t = out.get("TIPO", pd.Series([""] * len(out))).fillna("").astype(str)
     out["ES_LICENCIA"] = t.str.contains("LICEN", case=False, na=False)
     out["ES_VACACIONES"] = t.str.contains("VAC", case=False, na=False)
 
-    # 3) Regla base: teorico
     out["FTE_REAL_PERSONA"] = out["FTE_TEORICO_PERSONA"]
 
-    # 4) Licencia: si vigente hoy y duración inicial > 15 => 0
     cond_lic_0 = (out["ES_LICENCIA"]) & (out["VIGENTE_HOY"] == True) & (pd.to_numeric(out["DURACION_INICIAL"], errors="coerce") > 15)
     out.loc[cond_lic_0, "FTE_REAL_PERSONA"] = 0.0
 
-    # 5) Inclusión sobre-escribe todo
     out.loc[out["ES_INCLUSION"], "FTE_REAL_PERSONA"] = pd.to_numeric(out.loc[out["ES_INCLUSION"], "FTE_INCLUSION"], errors="coerce")
 
-    # Seguridad: NaN -> 0
     out["FTE_REAL_PERSONA"] = pd.to_numeric(out["FTE_REAL_PERSONA"], errors="coerce").fillna(0.0)
 
     return out
@@ -489,14 +441,6 @@ def aplicar_reglas_fte_persona(base: pd.DataFrame,
 # Resumen por tienda
 # =============================
 def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd.DataFrame:
-    """
-    Devuelve 1 fila por CECO con:
-      - GRUPO (nombre desde universo)
-      - DOTACION_REAL (nunique RUT)
-      - FTE REAL (suma FTE_REAL_PERSONA)
-      - FTE TEORICO (desde universo)
-      - BRECHA
-    """
     tmp = base_persona.dropna(subset=["CECO"]).copy()
 
     agg = tmp.groupby("CECO", dropna=False).agg(
@@ -505,11 +449,8 @@ def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd
     ).reset_index()
 
     res = universo.merge(agg, on="CECO", how="inner")
-
-    # Solo tiendas con dotación hoy
     res = res[res["DOTACION_REAL"] > 0].copy()
 
-    # Renombres finales (para que quede como tu Excel)
     res = res.rename(columns={
         "FTE_REAL": "FTE REAL",
         "FTE TEORICO": "FTE TEORICO"
@@ -517,74 +458,9 @@ def resumen_por_tienda(base_persona: pd.DataFrame, universo: pd.DataFrame) -> pd
 
     res["BRECHA (REAL-TEORICO)"] = res["FTE REAL"] - res["FTE TEORICO"]
 
-    # Orden de columnas
     cols = ["CECO", "GRUPO", "DOTACION_REAL", "FTE TEORICO", "FTE REAL", "BRECHA (REAL-TEORICO)"]
     res = res[cols].sort_values(["CECO"])
-
     return res
-ddef read_agrupador_cargo_map(path: Path) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name="AGRUPADOR", header=4)
-    df.columns = [str(c).strip().upper().replace("\xa0", " ") for c in df.columns]
-
-    cargo_col  = "CARGO"
-    agrupa_col = "AGRUPA CARGO_2"
-    fte_col    = "FTE TEORICO"
-
-    for col in (cargo_col, agrupa_col, fte_col):
-        if col not in df.columns:
-            raise ValueError(f"Falta columna '{col}' en AGRUPADOR. Columnas: {list(df.columns)}")
-
-    out = df[[cargo_col, agrupa_col, fte_col]].copy()
-    out = out.rename(columns={
-        cargo_col: "CARGO",
-        agrupa_col: "AGRUPA_CARGO",
-        fte_col: "FTE_AGRUPADOR",
-    })
-
-    out["CARGO"] = out["CARGO"].map(normalize_text)
-    out["AGRUPA_CARGO"] = out["AGRUPA_CARGO"].map(normalize_text)
-
-    # OJO decimales con coma
-    out["FTE_AGRUPADOR"] = (
-        out["FTE_AGRUPADOR"]
-        .astype(str)
-        .str.replace(",", ".", regex=False)
-    )
-    out["FTE_AGRUPADOR"] = pd.to_numeric(out["FTE_AGRUPADOR"], errors="coerce")
-
-    out = out.dropna(subset=["CARGO", "AGRUPA_CARGO", "FTE_AGRUPADOR"])
-    out = out[out["FTE_AGRUPADOR"].between(0, 1.2)]
-    out = out.drop_duplicates(subset=["CARGO"], keep="last")
-    return out
-
-
-def read_composicion_fte(path: Path) -> pd.DataFrame:
-    raw = pd.read_excel(path, sheet_name="COMPOSICION FTE", header=None)
-
-    # Encuentra la fila donde está el encabezado "CARGO" (col 1)
-    header_idx = None
-    for i in range(min(50, len(raw))):
-        v = raw.iloc[i, 1]
-        if isinstance(v, str) and v.strip().upper() == "CARGO":
-            header_idx = i
-            break
-    if header_idx is None:
-        raise ValueError("No encontré encabezado 'CARGO' en sheet COMPOSICION FTE")
-
-    # Datos vienen justo debajo: col0=factor, col1=cargo
-    df = raw.iloc[header_idx + 1:, [0, 1]].copy()
-    df.columns = ["FTE_FACTOR", "AGRUPA_CARGO"]
-
-    df["AGRUPA_CARGO"] = df["AGRUPA_CARGO"].astype(str).map(normalize_text)
-    df["FTE_FACTOR"] = pd.to_numeric(df["FTE_FACTOR"], errors="coerce")
-
-    df = df.dropna(subset=["AGRUPA_CARGO", "FTE_FACTOR"])
-    df = df[~df["AGRUPA_CARGO"].str.contains(r"^FTE AUTORIZADO$|^CARGO$", regex=True, na=False)]
-    df = df.drop_duplicates(subset=["AGRUPA_CARGO"], keep="last")
-
-    df = df.rename(columns={"FTE_FACTOR": "FTE_TEORICO_PERSONA"})
-    return df[["AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
-
 
 
 # =============================
@@ -597,12 +473,12 @@ def main():
     permisos  = read_permisos(FILES["permisos"])
     inclusion = read_talana_inclusion(FILES["talana"])
 
-    # ========= FTE Autorizado (tiendas) =========
+    # FTE Autorizado (tiendas)
     xls = pd.ExcelFile(FILES["fte_aut"])
     month_sheet = pick_latest_month_sheet(xls.sheet_names)
     fte_aut = read_fte_aut_sheet(FILES["fte_aut"], sheet_name=month_sheet)
 
-    # ========= Base: Gestion -> CECO =========
+    # Base Gestión -> CECO
     base = gestion.merge(
         fte_aut[["CECO", "STORE_KEY", "FTE AUT"]],
         on="STORE_KEY",
@@ -611,36 +487,28 @@ def main():
 
     base = base.merge(activos, on="RUT", how="left")
     base = base.merge(bajas, on="RUT", how="left")
+
     base = base.rename(columns={
         "FECHA INGRESO": "FECHA DE INGRESO",
         "FECHA EGRESO": "FECHA DE EGRESO",
         "FTE AUT": "FTE TEORICO TIENDA",
     })
 
-    # ========= 0) CARGO desde Talana (esto es lo que faltaba) =========
-    tal = pd.read_excel(FILES["talana"])
-    tal.columns = [str(c).strip().upper().replace("\xa0", " ") for c in tal.columns]
+    # Cargo desde Talana (para asegurar)
+    tal_cargos = read_talana_cargos(FILES["talana"])
+    base = base.merge(tal_cargos, on="RUT", how="left", suffixes=("", "_TAL"))
 
-    rut_col   = find_col(tal.columns, ["RUT", "RUN", "NATIONAL ID", "IDENTIFICADOR"])
-    cargo_col = find_col(tal.columns, ["CARGO", "PUESTO", "POSICION", "POSITION", "JOB"])
+    # Si venía CARGO de gestión y Talana también, priorizamos Talana cuando exista
+    if "CARGO_TAL" in base.columns:
+        base["CARGO"] = base["CARGO_TAL"].fillna(base["CARGO"])
+        base = base.drop(columns=["CARGO_TAL"])
 
-    if not rut_col or not cargo_col:
-        raise ValueError(f"No encontré columnas RUT/CARGO en Talana. Columnas: {list(tal.columns)}")
-
-    tal_cargos = tal[[rut_col, cargo_col]].copy()
-    tal_cargos = tal_cargos.rename(columns={rut_col: "RUT", cargo_col: "CARGO"})
-    tal_cargos["RUT"] = tal_cargos["RUT"].map(normalize_rut)
-    tal_cargos["CARGO"] = tal_cargos["CARGO"].map(normalize_text)
-    tal_cargos = tal_cargos.dropna(subset=["RUT"]).drop_duplicates(subset=["RUT"], keep="last")
-
-    base = base.merge(tal_cargos, on="RUT", how="left")
     base["CARGO"] = base["CARGO"].fillna("").map(normalize_text)
 
-    # ========= 1) Mapeos =========
+    # Mapeos de FTE teórico persona
     agr_map  = read_agrupador_cargo_map(FILES["agrupador"])  # CARGO -> AGRUPA_CARGO + FTE_AGRUPADOR
     comp_map = read_composicion_fte(FILES["fte_aut"])        # AGRUPA_CARGO -> FTE_TEORICO_PERSONA
 
-    # 1a) CARGO -> AGRUPA_CARGO (Agrupador)
     base = base.merge(agr_map, on="CARGO", how="left")
 
     sin_agr = base.loc[base["AGRUPA_CARGO"].isna() & (base["CARGO"] != ""), "CARGO"].value_counts().head(20)
@@ -648,43 +516,24 @@ def main():
     print(sin_agr.to_string())
     print("===========================================\n", flush=True)
 
-    # 1b) AGRUPA_CARGO -> FTE_TEORICO_PERSONA (Composición FTE)
     base = base.merge(comp_map, on="AGRUPA_CARGO", how="left")
 
-    # 2) Fallbacks
+    # Fallback: si no hay en composición, usar FTE del agrupador; si tampoco, 1.0
     if "FTE_AGRUPADOR" in base.columns:
         base["FTE_TEORICO_PERSONA"] = base["FTE_TEORICO_PERSONA"].fillna(base["FTE_AGRUPADOR"])
 
     base["FTE_TEORICO_PERSONA"] = pd.to_numeric(base["FTE_TEORICO_PERSONA"], errors="coerce").fillna(1.0)
 
-    print("\n=== CHECK 1: describe FTE_TEORICO_PERSONA ===")
-    print(base["FTE_TEORICO_PERSONA"].describe())
-    print("\nValores más comunes (top 15):")
-    print(base["FTE_TEORICO_PERSONA"].value_counts().head(15).to_string())
-
-    print("\nEjemplos (CARGO / AGRUPA_CARGO / FTE):")
-    print(
-        base[["CARGO", "AGRUPA_CARGO", "FTE_TEORICO_PERSONA"]]
-        .drop_duplicates()
-        .head(25)
-        .to_string(index=False)
-    )
-    print("=============================================\n", flush=True)
-
-
-    print("FTE_TEORICO_PERSONA describe:")
-    print(base["FTE_TEORICO_PERSONA"].describe(), flush=True)
-
-    # ========= Universo tiendas =========
+    # Universo tiendas
     universo = fte_aut.rename(columns={
         "NOMBRE_DISPLAY": "GRUPO",
         "FTE AUT": "FTE TEORICO",
     })[["CECO", "GRUPO", "FTE TEORICO"]].copy()
 
-    # ========= Reglas por persona =========
+    # Reglas por persona
     base_persona = aplicar_reglas_fte_persona(base, permisos, inclusion)
 
-    # ========= Resumen =========
+    # Resumen por tienda
     resumen = resumen_por_tienda(base_persona, universo)
 
     pivot = resumen.pivot_table(
@@ -693,7 +542,7 @@ def main():
         aggfunc="sum"
     ).reset_index()
 
-    # ========= Export =========
+    # Export
     out_path = OUTPUT / f"FTE_resultado_{TODAY.strftime('%Y-%m-%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         base_persona.to_excel(writer, index=False, sheet_name="BASE_PERSONA")
@@ -701,7 +550,6 @@ def main():
         pivot.to_excel(writer, index=False, sheet_name="PIVOT")
 
     print(f"OK -> {out_path}")
-
 
 
 if __name__ == "__main__":
